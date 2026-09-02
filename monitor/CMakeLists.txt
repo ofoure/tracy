@@ -12,10 +12,17 @@ project(
     VERSION ${TRACY_VERSION_STRING}
 )
 
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "tracy-monitor is Linux-only")
+endif()
+if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|aarch64|arm64)$")
+    message(FATAL_ERROR "tracy-monitor supports x86_64 and aarch64")
+endif()
+
 find_package(Threads REQUIRED)
+option(TRACY_ON_DEMAND "On-demand profiling: record samples only while a Tracy server is connected" OFF)
 
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/config.cmake)
-include(${CMAKE_CURRENT_LIST_DIR}/../cmake/vendor.cmake)
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/GitRef.cmake)
 
 set(PROGRAM_FILES
@@ -31,6 +38,9 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
     TRACY_MANUAL_LIFETIME
     TRACY_NO_FRAME_IMAGE
 )
+if(TRACY_ON_DEMAND)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE TRACY_ON_DEMAND)
+endif()
 target_link_libraries(${PROJECT_NAME} PRIVATE
     Threads::Threads
     ${CMAKE_DL_LIBS}

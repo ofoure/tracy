@@ -39,6 +39,7 @@ include(${CMAKE_CURRENT_LIST_DIR}/../cmake/config.cmake)
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/vendor.cmake)
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/server.cmake)
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/GitRef.cmake)
+include(${CMAKE_CURRENT_LIST_DIR}/../cmake/manual.cmake)
 
 include(ExternalProject)
 ExternalProject_Add(embed
@@ -48,18 +49,26 @@ ExternalProject_Add(embed
         -DCMAKE_INSTALL_PREFIX=${CMAKE_CURRENT_BINARY_DIR}
 )
 
+# Embeds a file into the profiler as a compressed C array (data/NAME.cpp/.hpp).
+# FILE is relative to the current source directory; with BUILD, relative to
+# the current build directory. With TEXT, line endings are normalized to unix.
 function(Embed LIST NAME FILE)
-    cmake_parse_arguments(EMBED "TEXT" "" "" ${ARGN})
+    cmake_parse_arguments(EMBED "TEXT;BUILD" "" "" ${ARGN})
     if(EMBED_TEXT)
         set(EMBED_FLAGS -t)
     else()
         set(EMBED_FLAGS)
     endif()
+    if(EMBED_BUILD)
+        set(EMBED_SOURCE ${CMAKE_CURRENT_BINARY_DIR}/${FILE})
+    else()
+        set(EMBED_SOURCE ${CMAKE_CURRENT_LIST_DIR}/${FILE})
+    endif()
     add_custom_command(
         OUTPUT data/${NAME}.cpp data/${NAME}.hpp
         COMMAND ${CMAKE_COMMAND} -E make_directory data
-        COMMAND ${CMAKE_CURRENT_BINARY_DIR}/embed ${EMBED_FLAGS} ${NAME} ${CMAKE_CURRENT_LIST_DIR}/${FILE} data/${NAME}
-        DEPENDS embed ${CMAKE_CURRENT_LIST_DIR}/${FILE}
+        COMMAND ${CMAKE_CURRENT_BINARY_DIR}/embed ${EMBED_FLAGS} ${NAME} ${EMBED_SOURCE} data/${NAME}
+        DEPENDS embed ${EMBED_SOURCE}
     )
     list(APPEND ${LIST} data/${NAME}.cpp)
     return(PROPAGATE ${LIST})
@@ -173,8 +182,23 @@ Embed(PROFILER_FILES FontBold src/font/Roboto-Bold.ttf)
 Embed(PROFILER_FILES FontItalic src/font/Roboto-Italic.ttf)
 Embed(PROFILER_FILES FontBoldItalic src/font/Roboto-BoldItalic.ttf)
 Embed(PROFILER_FILES FontEmoji src/font/NotoEmoji-Regular.ttf)
+set(MANUAL_MD ${CMAKE_CURRENT_BINARY_DIR}/manual/tracy.md)
+add_custom_command(
+    OUTPUT ${MANUAL_MD}
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/../manual/latex2md.py
+            --tex ${CMAKE_CURRENT_LIST_DIR}/../manual/tracy.tex
+            --out ${MANUAL_MD}
+            --pandoc ${TRACY_PANDOC}
+            --icons ${CMAKE_CURRENT_LIST_DIR}/src/profiler/IconsFontAwesome7.h
+    DEPENDS
+        ${CMAKE_CURRENT_LIST_DIR}/../manual/tracy.tex
+        ${CMAKE_CURRENT_LIST_DIR}/../manual/filter.lua
+        ${CMAKE_CURRENT_LIST_DIR}/../manual/latex2md.py
+        ${CMAKE_CURRENT_LIST_DIR}/src/profiler/IconsFontAwesome7.h
+    COMMENT "Generating user manual"
+    VERBATIM)
 
-Embed(PROFILER_FILES Manual ../manual/tracy.md TEXT)
+Embed(PROFILER_FILES Manual manual/tracy.md TEXT BUILD)
 
 Embed(PROFILER_FILES Text100Million src/achievements/100Million.md TEXT)
 Embed(PROFILER_FILES TextConnectToClient src/achievements/ConnectToClient.md TEXT)

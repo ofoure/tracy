@@ -416,12 +416,11 @@ static int64_t SetupHwTimer()
 }
 #endif
 
-uint32_t ___tracy_magic_pid_override = 0;
-char ___tracy_magic_process_name[64] = {};
-
 static const char* GetProcessName()
 {
-    if( *___tracy_magic_process_name != 0 ) return ___tracy_magic_process_name;
+#ifdef TRACY_HAS_EXTERNAL_TARGET
+    if( GetExternalTargetPid() != 0 ) return GetExternalTargetName();
+#endif
 
     const char* processName = "unknown";
 #ifdef _WIN32
@@ -750,7 +749,10 @@ static const char* GetHostInfo()
 
 static uint64_t GetPid()
 {
-    if( ___tracy_magic_pid_override != 0 ) return uint64_t( ___tracy_magic_pid_override );
+#ifdef TRACY_HAS_EXTERNAL_TARGET
+    const auto externalPid = GetExternalTargetPid();
+    if( externalPid != 0 ) return uint64_t( externalPid );
+#endif
 
 #if defined _WIN32
     return uint64_t( GetCurrentProcessId() );
@@ -918,6 +920,7 @@ std::atomic<bool> s_symbolThreadGone { false };
 #endif
 #ifdef TRACY_HAS_SYSTEM_TRACING
 static std::atomic<Thread*> s_sysTraceThread(nullptr);
+static std::atomic<bool> s_sysTraceStartFailed(false);
 #endif
 
 #if defined __linux__ && !defined TRACY_NO_CRASH_HANDLER
@@ -1173,11 +1176,16 @@ static void StartSystemTracing( int64_t& samplingPeriod )
     }
     else if( SysTraceStart( samplingPeriod ) )
     {
+        s_sysTraceStartFailed.store( false, std::memory_order_release );
         Thread* sysTraceThread = (Thread*)tracy_malloc( sizeof( Thread ) );
         new( sysTraceThread ) Thread( SysTraceWorker, nullptr );
         Thread* prev = s_sysTraceThread.exchange( sysTraceThread );
         TRACY_ASSERT( prev == nullptr );
         std::this_thread::sleep_for( std::chrono::milliseconds( 1 ) );
+    }
+    else
+    {
+        s_sysTraceStartFailed.store( true, std::memory_order_release );
     }
 }
 
@@ -1510,6 +1518,26 @@ TRACY_API bool ProfilerAllocatorAvailable() { return !RpThreadShutdown; }
 
 TRACY_API bool BeginSamplingProfiling() { return GetProfiler().BeginSamplingProfiling(); }
 TRACY_API void EndSamplingProfiling() { return GetProfiler().EndSamplingProfiling(); }
+TRACY_API bool IsSystemTracingFailed()
+{
+#if defined(TRACY_HAS_SYSTEM_TRACING)
+    return s_sysTraceStartFailed.load( std::memory_order_acquire );
+#else
+    return false;
+#endif
+}
+
+static std::atomic<int> s_reservedListenFd( -1 );
+
+TRACY_API void SetReservedListenSocket( int fd )
+{
+    TRACY_ASSERT( fd >= 0 );
+    s_reservedListenFd.store( fd, std::memory_order_release );
+}
+
+static std::atomic<bool> s_dataPortListening(false);
+
+TRACY_API bool IsDataPortListening() { return s_dataPortListening.load( std::memory_order_acquire ); }
 
 constexpr static size_t SafeSendBufferSize = 65536;
 
@@ -1796,13 +1824,22 @@ void Profiler::Worker()
 #endif
 
     m_exectime = 0;
-    const auto execname = GetProcessExecutablePath();
-    if( execname )
+#ifdef TRACY_HAS_EXTERNAL_TARGET
+    if( GetExternalTargetPid() != 0 )
     {
-        struct stat st;
-        if( stat( execname, &st ) == 0 )
+        m_exectime = GetExternalTargetExeTime();
+    }
+    else
+#endif
+    {
+        const auto execname = GetProcessExecutablePath();
+        if( execname )
         {
-            m_exectime = (uint64_t)st.st_mtime;
+            struct stat st;
+            if( stat( execname, &st ) == 0 )
+            {
+                m_exectime = (uint64_t)st.st_mtime;
+            }
         }
     }
 
@@ -1881,7 +1918,13 @@ void Profiler::Worker()
 
     ListenSocket listen;
     bool isListening = false;
-    if( !dataPortSearch )
+    const int reservedFd = s_reservedListenFd.exchange( -1, std::memory_order_acquire );
+    if( reservedFd != -1 )
+    {
+        listen.Adopt( reservedFd );
+        isListening = true;
+    }
+    else if( !dataPortSearch )
     {
         isListening = listen.Listen( dataPort, 4 );
     }
@@ -1897,6 +1940,9 @@ void Profiler::Worker()
             }
         }
     }
+    if( isListening ) dataPort = listen.LocalPort();
+
+    s_dataPortListening.store( isListening, std::memory_order_release );
     if( !isListening )
     {
         for(;;)
@@ -3743,7 +3789,6 @@ void Profiler::QueueKernelCode( uint64_t symbol, uint32_t size )
 
 void Profiler::QueueSourceCodeQuery( uint32_t id )
 {
-    TRACY_ASSERT( m_exectime != 0 );
     TRACY_ASSERT( m_queryData );
     m_symbolQueue.emplace( SymbolQueueItem { SymbolQueueItemType::SourceCode, uint64_t( m_queryData ), uint64_t( m_queryImage ), id } );
     m_queryData = nullptr;
@@ -4432,29 +4477,35 @@ void Profiler::HandleParameter( uint64_t payload )
 
 void Profiler::HandleSymbolCodeQuery( uint64_t symbol, uint32_t size )
 {
-#ifdef __linux__
-    // When profiling an external process, symbol addresses are ELF virtual
-    // addresses, not pointers in the monitor's address space.  We cannot
-    // read code bytes directly.
-    if( ___tracy_magic_pid_override != 0 )
-    {
-        AckSymbolCodeNotAvailable();
-        return;
-    }
-#endif
     if( symbol >> 63 != 0 )
     {
         QueueKernelCode( symbol, size );
+        return;
     }
-    else
-    {
-        auto&& lambda = [ this, symbol ]( const char* buf, size_t size ) {
-            SendLongString( symbol, buf, size, QueueType::SymbolCode );
-        };
 
-        // 'symbol' may have come from a module that has since unloaded, perform a safe copy before sending
-        if( !WithSafeCopy( (const char*)symbol, size, lambda ) ) AckSymbolCodeNotAvailable();
+    auto&& lambda = [ this, symbol ]( const char* buf, size_t size ) {
+        SendLongString( symbol, buf, size, QueueType::SymbolCode );
+    };
+
+#ifdef TRACY_HAS_EXTERNAL_TARGET
+    if( GetExternalTargetPid() != 0 )
+    {
+        auto buf = (char*)tracy_malloc_fast( size );
+        if( ReadExternalTargetMemory( symbol, size, buf ) == size )
+        {
+            lambda( buf, size );
+        }
+        else
+        {
+            AckSymbolCodeNotAvailable();
+        }
+        tracy_free_fast( buf );
+        return;
     }
+#endif
+
+    // 'symbol' may have come from a module that has since unloaded, perform a safe copy before sending
+    if( !WithSafeCopy( (const char*)symbol, size, lambda ) ) AckSymbolCodeNotAvailable();
 }
 
 void Profiler::HandleSourceCodeQuery( char* data, char* image, uint32_t id )
